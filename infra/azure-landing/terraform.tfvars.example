@@ -1,0 +1,8 @@
+# Copy to terraform.tfvars (gitignored) and fill in.
+subscription_id = "00000000-0000-0000-0000-000000000000" # az account show --query id -o tsv
+
+# Defaults, override if needed:
+# resource_group_name  = "rg-datalake-test-uksouth"
+# storage_account_name = "homelablandfileshare"
+# file_share_name      = "landing"
+# file_share_quota_gb  = 5

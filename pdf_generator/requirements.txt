@@ -1,0 +1,6 @@
+# Only needed to run the generator outside the containers; the Jupyter and Airflow
+# images already include these.
+Faker==40.28.1
+reportlab==5.0.0
+numpy>=1.26
+pandas>=2.2

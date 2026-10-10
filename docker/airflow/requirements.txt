@@ -1,0 +1,12 @@
+# Installed with the official constraints file (see Dockerfile), so no pins here.
+apache-airflow-providers-apache-spark
+apache-airflow-providers-microsoft-mssql
+apache-airflow-providers-common-sql
+
+# Grid report PDF generator (pdf_generator/) and PDF parsing; not pinned by the constraints file
+Faker==40.28.1
+reportlab==5.0.0
+pdfplumber
+
+# Azure File Share landing layer (jobs/land_*_sftp_to_azure.py); version from the constraints file
+azure-storage-file-share

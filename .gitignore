@@ -1,0 +1,46 @@
+# Secrets
+.env
+
+# Runtime data / generated output
+data/output/
+spark-events/*
+!spark-events/.gitkeep
+airflow/logs/
+airflow/config/airflow.cfg
+
+# Python / Jupyter
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# SFTP uploads
+data/sftp/
+
+# Generated grid report PDFs (reproducible: python -m grid_reports.generate_historical_reports)
+data/Grid_Report/
+
+# Terraform: state holds the storage account keys
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+crash.log
+
+# Terraform plan files (binary; contain subscription and resource details)
+tfplan
+*.tfplan
+
+# Private documentation and personal notes (kept locally, not published)
+docs/
+note.txt
+
+# Misc
+*.log

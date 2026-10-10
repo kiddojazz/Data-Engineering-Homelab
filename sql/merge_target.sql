@@ -1,0 +1,11 @@
+-- Phase 4 placeholder: staging -> target upsert on the external SQL Server.
+-- Spark writes dbo.stg_sales over JDBC; Airflow then runs this via SQLExecuteQueryOperator (conn: mssql_default).
+--
+-- MERGE dbo.sales AS t
+-- USING dbo.stg_sales AS s
+--   ON t.order_id = s.order_id
+-- WHEN MATCHED THEN
+--   UPDATE SET t.quantity = s.quantity, t.unit_price = s.unit_price, t.updated_at = SYSUTCDATETIME()
+-- WHEN NOT MATCHED BY TARGET THEN
+--   INSERT (order_id, order_date, customer_id, region, product, quantity, unit_price, updated_at)
+--   VALUES (s.order_id, s.order_date, s.customer_id, s.region, s.product, s.quantity, s.unit_price, SYSUTCDATETIME());

@@ -1,0 +1,13 @@
+order_id,order_date,customer_id,region,product,quantity,unit_price
+1001,2026-09-01,C001,North,Laptop,1,1200.00
+1002,2026-09-01,C002,South,Mouse,3,25.50
+1003,2026-09-02,C003,East,Monitor,2,310.00
+1004,2026-09-02,C001,North,Keyboard,1,75.00
+1005,2026-09-03,C004,West,Laptop,2,1150.00
+1006,2026-09-03,C005,South,Headset,4,89.99
+1007,2026-09-04,C002,South,Monitor,1,299.00
+1008,2026-09-04,C006,East,Mouse,5,24.00
+1009,2026-09-05,C007,West,Keyboard,2,70.00
+1010,2026-09-05,C003,East,Laptop,1,1250.00
+1011,2026-09-06,C008,North,Headset,2,95.00
+1012,2026-09-06,C004,West,Monitor,3,305.00

@@ -1,0 +1,19 @@
+# Packages for running the project's scripts directly on Windows (outside Docker).
+#   python -m venv .venv
+#   .venv\Scripts\activate
+#   pip install -r requirements-local.txt
+
+# jobs/migrate_grid_reports_to_sftp.py
+paramiko
+
+# pdf_generator/ (same versions as the Docker images)
+Faker==40.28.1
+reportlab==5.0.0
+numpy>=1.26
+pandas>=2.2
+
+# jobs/land_*_sftp_to_azure.py (same version Airflow's constraints pin)
+azure-storage-file-share==12.26.0
+
+# jobs/test_sqlserver_connection.py and the SQL Server load (pymssql is also in the Jupyter/Airflow images)
+pymssql

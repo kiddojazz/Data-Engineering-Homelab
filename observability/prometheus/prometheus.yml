@@ -1,0 +1,46 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Airflow metrics arrive via OTLP at the collector and are re-exposed here.
+  - job_name: otel-collector
+    static_configs:
+      - targets: ["otel-collector:8889"]
+
+  # Spark standalone cluster (PrometheusServlet, see conf/spark/metrics.properties)
+  - job_name: spark-master
+    metrics_path: /metrics/master/prometheus
+    static_configs:
+      - targets: ["spark-master:8080"]
+
+  - job_name: spark-applications
+    metrics_path: /metrics/applications/prometheus
+    static_configs:
+      - targets: ["spark-master:8080"]
+
+  - job_name: spark-workers
+    metrics_path: /metrics/prometheus
+    static_configs:
+      - targets: ["spark-worker-1:8081", "spark-worker-2:8081"]
+
+  # Container CPU / memory / network
+  - job_name: cadvisor
+    static_configs:
+      - targets: ["cadvisor:8080"]
+
+  - job_name: loki
+    static_configs:
+      - targets: ["loki:3100"]
+
+  - job_name: alloy
+    static_configs:
+      - targets: ["alloy:12345"]
+
+  - job_name: grafana
+    static_configs:
+      - targets: ["grafana:3000"]

@@ -1,0 +1,388 @@
+# Homelab data-engineering stack: Spark + Jupyter + Airflow + observability.
+# Core (Spark, Jupyter) always starts; `airflow` and `observability` are profiles,
+# enabled by default through COMPOSE_PROFILES in .env.
+
+name: spark-homelab
+
+x-spark-build: &spark-build-args
+  SPARK_VERSION: "4.1.3"
+  DELTA_VERSION: "4.4.0"
+  DELTA_SPARK_ARTIFACT: "delta-spark_4.1_2.13"
+  MSSQL_JDBC_VERSION: "13.6.0.jre11"
+
+# Paths are identical in every container that runs Spark code (drivers + executors).
+x-spark-volumes: &spark-volumes
+  - ./conf/spark:/opt/spark-conf:ro
+  - ./jobs:/opt/spark-jobs
+  - ./data:/opt/spark-data
+  - ./spark-events:/opt/spark-events
+
+x-airflow-common: &airflow-common
+  image: spark-homelab/airflow:3.3.2
+  profiles: [airflow]
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-airflow}:${POSTGRES_PASSWORD:-airflow}@postgres/${POSTGRES_DB:-airflow}
+    AIRFLOW__CORE__FERNET_KEY: ${FERNET_KEY:-}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW__API_AUTH__JWT_SECRET:-airflow_jwt_secret}
+    AIRFLOW__API_AUTH__JWT_ISSUER: airflow
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    AIRFLOW_CONFIG: /opt/airflow/config/airflow.cfg
+    GRID_REPORTS_ROOT: /opt/spark-data/Grid_Report
+    # SFTP server as seen from inside the Docker network (service name, container port 22)
+    SFTP_HOST: sftp
+    SFTP_PORT: "22"
+    SFTP_USERNAME: ${SFTP_USERNAME:-homelab}
+    SFTP_PASSWORD: ${SFTP_PASSWORD:-homelab}
+    SFTP_HOST_KEY_FINGERPRINT: ${SFTP_HOST_KEY_FINGERPRINT:-}
+    # On-premise SQL Server (grid report ETL: the Spark driver runs inside the scheduler)
+    MSSQL_HOST: ${MSSQL_HOST:-host.docker.internal}
+    MSSQL_PORT: ${MSSQL_PORT:-1433}
+    MSSQL_DB: ${MSSQL_DB:-master}
+    MSSQL_USER: ${MSSQL_USER:-sa}
+    MSSQL_PASSWORD: ${MSSQL_PASSWORD:-}
+    # Azure File Share landing layer (SFTP -> Azure)
+    AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING:-}
+    AZURE_FILE_SHARE_NAME: ${AZURE_FILE_SHARE_NAME:-landing}
+    AZURE_LANDING_ROOT: ${AZURE_LANDING_ROOT:-Grid_Report}
+    # Metrics -> OTel collector (observability profile). Set AIRFLOW_OTEL_ON=False in .env
+    # when running Airflow without the observability stack.
+    AIRFLOW__METRICS__OTEL_ON: ${AIRFLOW_OTEL_ON:-True}
+    AIRFLOW__METRICS__OTEL_HOST: otel-collector
+    AIRFLOW__METRICS__OTEL_PORT: "4318"
+    AIRFLOW__METRICS__OTEL_PREFIX: airflow
+    AIRFLOW__METRICS__OTEL_INTERVAL_MILLISECONDS: "15000"
+    # Connections defined as env vars (visible to tasks; not listed in the UI's Connections page).
+    AIRFLOW_CONN_SPARK_DEFAULT: '{"conn_type": "spark", "host": "spark://spark-master", "port": 7077, "extra": {"deploy-mode": "client", "spark-binary": "spark-submit"}}'
+    # Slack bot (xoxb- token) for DAG failure alerts; SLACK_BOT_TOKEN / SLACK_ALERT_CHANNEL in .env
+    AIRFLOW_CONN_SLACK_ALERTS: '{"conn_type": "slack", "password": "${SLACK_BOT_TOKEN:-}"}'
+    SLACK_ALERT_CHANNEL: ${SLACK_ALERT_CHANNEL:-#homelab-alerts}
+    # Public address of the Airflow UI, used in alert "Open the task log" links (8080 is the Spark UI here)
+    AIRFLOW__API__BASE_URL: http://localhost:8088
+    AIRFLOW_CONN_MSSQL_DEFAULT: '{"conn_type": "mssql", "host": "${MSSQL_HOST:-host.docker.internal}", "port": ${MSSQL_PORT:-1433}, "schema": "${MSSQL_DB:-master}", "login": "${MSSQL_USER:-sa}", "password": "${MSSQL_PASSWORD:-}"}'
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/config:/opt/airflow/config
+    - ./airflow/plugins:/opt/airflow/plugins
+    - ./pdf_generator:/opt/pdf_generator
+    - ./conf/spark:/opt/spark-conf:ro
+    - ./jobs:/opt/spark-jobs
+    - ./data:/opt/spark-data
+    - ./spark-events:/opt/spark-events
+  user: "${AIRFLOW_UID:-50000}:0"
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  restart: unless-stopped
+  depends_on: &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+
+x-spark-common: &spark-common
+  image: spark-homelab/spark:4.1.3
+  volumes: *spark-volumes
+  # Executors write to the on-premise SQL Server over JDBC (MSSQL_HOST=host.docker.internal)
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  restart: unless-stopped
+
+services:
+  # ---------------------------------------------------------------- Spark ----
+  spark-master:
+    <<: *spark-common
+    build:
+      context: ./docker/spark
+      args: *spark-build-args
+    hostname: spark-master
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.master.Master",
+              "--host", "spark-master", "--port", "7077", "--webui-port", "8080"]
+    ports:
+      - "8080:8080"   # master UI
+      - "7077:7077"   # master RPC
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/json/"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  spark-worker-1: &spark-worker
+    <<: *spark-common
+    hostname: spark-worker-1
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.worker.Worker",
+              "--webui-port", "8081", "spark://spark-master:7077"]
+    environment:
+      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-4}
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-6g}
+    ports:
+      - "8081:8081"
+    depends_on:
+      spark-master:
+        condition: service_healthy
+
+  spark-worker-2:
+    <<: *spark-worker
+    hostname: spark-worker-2
+    ports:
+      - "8082:8081"
+
+  spark-history:
+    <<: *spark-common
+    hostname: spark-history
+    command: ["/opt/spark/bin/spark-class", "org.apache.spark.deploy.history.HistoryServer"]
+    ports:
+      - "18080:18080"
+    depends_on:
+      spark-master:
+        condition: service_healthy
+
+  # -------------------------------------------------------------- Jupyter ----
+  jupyter:
+    build:
+      context: ./docker/jupyter
+      args: *spark-build-args
+    image: spark-homelab/jupyter:4.1.3
+    hostname: jupyter
+    environment:
+      JUPYTER_TOKEN: ${JUPYTER_TOKEN:-homelab}
+      GRID_REPORTS_ROOT: /opt/spark-data/Grid_Report
+      AZURE_STORAGE_CONNECTION_STRING: ${AZURE_STORAGE_CONNECTION_STRING:-}
+      AZURE_FILE_SHARE_NAME: ${AZURE_FILE_SHARE_NAME:-landing}
+      AZURE_LANDING_ROOT: ${AZURE_LANDING_ROOT:-Grid_Report}
+      MSSQL_HOST: ${MSSQL_HOST:-host.docker.internal}
+      MSSQL_PORT: ${MSSQL_PORT:-1433}
+      MSSQL_DB: ${MSSQL_DB:-master}
+      MSSQL_USER: ${MSSQL_USER:-sa}
+      MSSQL_PASSWORD: ${MSSQL_PASSWORD:-}
+    volumes:
+      - ./conf/spark:/opt/spark-conf:ro
+      - ./jobs:/opt/spark-jobs
+      - ./data:/opt/spark-data
+      - ./spark-events:/opt/spark-events
+      - ./notebooks:/home/jovyan/work
+      - ./pdf_generator:/opt/pdf_generator
+    ports:
+      - "8888:8888"   # JupyterLab
+      - "4040:4040"   # Spark driver UI of the notebook session
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ----------------------------------------------------------------- SFTP ----
+  # Landing zone for incoming files. Uploads land in ./data/sftp/upload, which Spark
+  # and Airflow already see as /opt/spark-data/sftp/upload.
+  sftp:
+    image: atmoz/sftp:alpine
+    command: ${SFTP_USERNAME:-homelab}:${SFTP_PASSWORD:-homelab}:::upload
+    ports:
+      - "${SFTP_PORT:-22}:22"
+    volumes:
+      - ./data/sftp/upload:/home/${SFTP_USERNAME:-homelab}/upload
+      # Persists the generated SSH host keys (image expects them directly in /etc/ssh),
+      # so clients don't get "host key changed" warnings after a recreate.
+      - sftp-ssh:/etc/ssh
+    restart: unless-stopped
+
+  # -------------------------------------------------------------- Airflow ----
+  postgres:
+    image: postgres:16
+    profiles: [airflow]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-airflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-airflow}
+      POSTGRES_DB: ${POSTGRES_DB:-airflow}
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER:-airflow}"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  airflow-init:
+    <<: *airflow-common
+    build:
+      context: ./docker/airflow
+      args:
+        <<: *spark-build-args
+        AIRFLOW_VERSION: "3.3.2"
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -v -p /opt/airflow/{logs,dags,plugins,config}
+        /entrypoint airflow version
+        /entrypoint airflow config list > /dev/null
+        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/{logs,dags,plugins,config}
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
+    user: "0:0"
+    restart: "no"
+
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "8088:8080"   # Airflow UI + REST API (8080 on the host is the Spark master UI)
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # LocalExecutor: tasks (and therefore Spark drivers) run inside this container,
+  # so its hostname must be resolvable by the executors.
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    hostname: airflow-scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # -------------------------------------------------------- Observability ----
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.161.0
+    profiles: [observability]
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./observability/otel/otel-config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    profiles: [observability]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+  loki:
+    image: grafana/loki:3.7.8
+    profiles: [observability]
+    command: ["-config.file=/etc/loki/config.yaml"]
+    volumes:
+      - ./observability/loki/loki-config.yaml:/etc/loki/config.yaml:ro
+      - loki-data:/loki
+    ports:
+      - "3100:3100"
+    restart: unless-stopped
+
+  alloy:
+    image: grafana/alloy:v1.20.1
+    profiles: [observability]
+    command: ["run", "--server.http.listen-addr=0.0.0.0:12345",
+              "--storage.path=/var/lib/alloy/data", "/etc/alloy/config.alloy"]
+    volumes:
+      - ./observability/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    ports:
+      - "12345:12345"   # Alloy UI
+    depends_on:
+      - loki
+    restart: unless-stopped
+
+  cadvisor:
+    image: ghcr.io/google/cadvisor:v0.60.6
+    profiles: [observability]
+    privileged: true
+    devices:
+      - /dev/kmsg
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    command: ["--docker_only=true", "--housekeeping_interval=15s"]
+    ports:
+      - "8090:8080"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:13.2.3
+    profiles: [observability]
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+      - loki
+    restart: unless-stopped
+
+volumes:
+  postgres-db-volume:
+  prometheus-data:
+  loki-data:
+  grafana-data:
+  sftp-ssh:

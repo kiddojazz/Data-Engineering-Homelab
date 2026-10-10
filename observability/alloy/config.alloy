@@ -1,0 +1,45 @@
+// Ship stdout/stderr of every container in this compose project to Loki.
+// Labels: container, service (compose service name), project, stream.
+
+discovery.docker "homelab" {
+  host = "unix:///var/run/docker.sock"
+  filter {
+    name   = "label"
+    values = ["com.docker.compose.project=spark-homelab"]
+  }
+}
+
+discovery.relabel "homelab" {
+  targets = []
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+    target_label  = "project"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_log_stream"]
+    target_label  = "stream"
+  }
+}
+
+loki.source.docker "homelab" {
+  host          = "unix:///var/run/docker.sock"
+  targets       = discovery.docker.homelab.targets
+  relabel_rules = discovery.relabel.homelab.rules
+  forward_to    = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
