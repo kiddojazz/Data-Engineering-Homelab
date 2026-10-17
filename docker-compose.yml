@@ -1,6 +1,6 @@
-# Homelab data-engineering stack: Spark + Jupyter + Airflow + observability.
-# Core (Spark, Jupyter) always starts; `airflow` and `observability` are profiles,
-# enabled by default through COMPOSE_PROFILES in .env.
+# Homelab data-engineering stack: Spark + Jupyter + Airflow + observability + AI agent.
+# Core (Spark, Jupyter, SFTP) always starts; `airflow`, `observability` and `agent` are
+# profiles, enabled through COMPOSE_PROFILES in .env.
 
 name: spark-homelab
 
@@ -380,9 +380,234 @@ services:
       - loki
     restart: unless-stopped
 
+  # ------------------------------------------------------ Langfuse (agent) ----
+  # Self-hosted Langfuse v4 for the GridIQ agent's traces (profile `agent`).
+  # Based on the official compose file (github.com/langfuse/langfuse/docker-compose.yml);
+  # services are prefixed `langfuse-` and settings use LANGFUSE_* names so nothing collides
+  # with Airflow's postgres or the POSTGRES_* variables. Only the UI is published (:3001).
+  langfuse-worker:
+    image: docker.langfuse.com/langfuse/langfuse-worker:4
+    profiles: [agent]
+    restart: unless-stopped
+    depends_on: &langfuse-depends-on
+      langfuse-postgres:
+        condition: service_healthy
+      langfuse-minio:
+        condition: service_healthy
+      langfuse-redis:
+        condition: service_healthy
+      langfuse-clickhouse:
+        condition: service_healthy
+    environment: &langfuse-env
+      NEXTAUTH_URL: http://localhost:3001
+      DATABASE_URL: postgresql://langfuse:${LANGFUSE_DB_PASSWORD:-langfuse}@langfuse-postgres:5432/langfuse
+      SALT: ${LANGFUSE_SALT:-}
+      ENCRYPTION_KEY: ${LANGFUSE_ENCRYPTION_KEY:-}
+      TELEMETRY_ENABLED: "false"
+      CLICKHOUSE_MIGRATION_URL: clickhouse://langfuse-clickhouse:9000
+      CLICKHOUSE_URL: http://langfuse-clickhouse:8123
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD:-clickhouse}
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: auto
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_MINIO_PASSWORD:-miniosecret}
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_EVENT_UPLOAD_PREFIX: events/
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: auto
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: ${LANGFUSE_MINIO_PASSWORD:-miniosecret}
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://langfuse-minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: media/
+      REDIS_HOST: langfuse-redis
+      REDIS_PORT: "6379"
+      REDIS_AUTH: ${LANGFUSE_REDIS_PASSWORD:-myredissecret}
+
+  langfuse-web:
+    image: docker.langfuse.com/langfuse/langfuse:4
+    profiles: [agent]
+    restart: unless-stopped
+    depends_on: *langfuse-depends-on
+    ports:
+      - "3001:3000"   # Langfuse UI (3000 is Grafana)
+    environment:
+      <<: *langfuse-env
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:-}
+      # browser-facing media URL (MinIO published on 9092; 9090 is Prometheus)
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://localhost:9092
+      LANGFUSE_S3_MEDIA_UPLOAD_INTERNAL_ENDPOINT: http://langfuse-minio:9000
+      # first start: create the org, the project (with the agent's API keys) and your login
+      LANGFUSE_INIT_ORG_ID: spark-homelab
+      LANGFUSE_INIT_ORG_NAME: Spark Homelab
+      LANGFUSE_INIT_PROJECT_ID: gridiq
+      LANGFUSE_INIT_PROJECT_NAME: GridIQ agent
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_INIT_USER_EMAIL:-}
+      LANGFUSE_INIT_USER_NAME: ${LANGFUSE_INIT_USER_NAME:-admin}
+      LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://$$(hostname -i):3000/api/public/health >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+
+  langfuse-clickhouse:
+    image: docker.io/clickhouse/clickhouse-server:25.12
+    profiles: [agent]
+    restart: unless-stopped
+    user: "101:101"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: ${LANGFUSE_CLICKHOUSE_PASSWORD:-clickhouse}
+    volumes:
+      - langfuse-clickhouse-data:/var/lib/clickhouse
+      - langfuse-clickhouse-logs:/var/log/clickhouse-server
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 1s
+
+  langfuse-minio:
+    image: cgr.dev/chainguard/minio
+    profiles: [agent]
+    restart: unless-stopped
+    entrypoint: sh
+    command: -c 'mkdir -p /data/langfuse && minio server --address ":9000" --console-address ":9001" /data'
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: ${LANGFUSE_MINIO_PASSWORD:-miniosecret}
+    ports:
+      - "9092:9000"   # S3 API for media links in the UI (9090 is Prometheus)
+    volumes:
+      - langfuse-minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+      start_period: 1s
+
+  langfuse-redis:
+    image: docker.io/redis:7
+    profiles: [agent]
+    restart: unless-stopped
+    command: >
+      --requirepass ${LANGFUSE_REDIS_PASSWORD:-myredissecret}
+      --maxmemory-policy noeviction
+    volumes:
+      - langfuse-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 10s
+      retries: 10
+
+  langfuse-postgres:
+    image: docker.io/postgres:17
+    profiles: [agent]
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: ${LANGFUSE_DB_PASSWORD:-langfuse}
+      POSTGRES_DB: langfuse
+      TZ: UTC
+      PGTZ: UTC
+    volumes:
+      - langfuse-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  # -------------------------------------------------------- GridIQ agent API ----
+  # FastAPI service: Slack Events API (/slack/events) + /ask + /health, running the LangGraph
+  # text-to-SQL agent. Memory: Postgres checkpointer (database gridiq_memory on langfuse-postgres).
+  agent-api:
+    build:
+      context: ./agent
+      dockerfile: ../docker/agent/Dockerfile
+    image: spark-homelab/agent-api:1.0
+    profiles: [agent]
+    hostname: agent-api
+    restart: unless-stopped
+    environment:
+      # Azure OpenAI (Microsoft Foundry), gpt-4o
+      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT:-}
+      AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-}
+      AZURE_OPENAI_API_VERSION: ${AZURE_OPENAI_API_VERSION:-2024-10-21}
+      AZURE_OPENAI_CHAT_DEPLOYMENT: ${AZURE_OPENAI_CHAT_DEPLOYMENT:-gpt-4o}
+      AZURE_OPENAI_TEMPERATURE: ${AZURE_OPENAI_TEMPERATURE:-0}
+      # SQL Server (read-only login, on the Windows host)
+      AGENT_MSSQL_HOST: ${AGENT_MSSQL_HOST:-host.docker.internal}
+      AGENT_MSSQL_PORT: ${MSSQL_PORT:-1433}
+      AGENT_MSSQL_DB: ${MSSQL_DB:-MonitoringLab}
+      AGENT_MSSQL_USER: ${AGENT_MSSQL_USER:-grid_agent_reader}
+      AGENT_MSSQL_PASSWORD: ${AGENT_MSSQL_PASSWORD:-}
+      AGENT_MAX_ROWS: ${AGENT_MAX_ROWS:-200}
+      AGENT_QUERY_TIMEOUT_S: ${AGENT_QUERY_TIMEOUT_S:-30}
+      AGENT_MAX_TOOL_CALLS: ${AGENT_MAX_TOOL_CALLS:-6}
+      # conversation memory (Postgres checkpointer)
+      AGENT_MEMORY_DB_HOST: langfuse-postgres
+      AGENT_MEMORY_DB_USER: langfuse
+      AGENT_MEMORY_DB_PASSWORD: ${LANGFUSE_DB_PASSWORD:-langfuse}
+      AGENT_MEMORY_DB_NAME: gridiq_memory
+      # Langfuse tracing (container-to-container address)
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_BASE_URL: http://langfuse-web:3000
+      # Slack (eagle-bot)
+      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}
+      SLACK_SIGNING_SECRET: ${SLACK_SIGNING_SECRET:-}
+    volumes:
+      - ./agent:/app/agent:ro      # live code: `docker compose restart agent-api` after edits
+    ports:
+      - "127.0.0.1:8010:8000"      # local only; Slack reaches it through ngrok
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      langfuse-postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=5).status == 200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ---------------------------------------------------------------- ngrok ----
+  # Public HTTPS URL for Slack's Events API -> agent-api (static domain from your ngrok account).
+  # Slack Request URL: https://${NGROK_DOMAIN}/slack/events   ngrok inspector: http://localhost:4041
+  ngrok:
+    image: ngrok/ngrok:3.39.11-alpine
+    profiles: [agent]
+    restart: unless-stopped
+    command: ["http", "--url=${NGROK_DOMAIN:-}", "--log=stdout", "agent-api:8000"]
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN:-}
+    ports:
+      - "127.0.0.1:4041:4040"      # local request inspector (4040 is the Jupyter Spark UI)
+    depends_on:
+      agent-api:
+        condition: service_healthy
+
 volumes:
   postgres-db-volume:
   prometheus-data:
   loki-data:
   grafana-data:
   sftp-ssh:
+  langfuse-postgres-data:
+  langfuse-clickhouse-data:
+  langfuse-clickhouse-logs:
+  langfuse-minio-data:
+  langfuse-redis-data:

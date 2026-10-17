@@ -38,9 +38,14 @@ crash.log
 tfplan
 *.tfplan
 
-# Private documentation and personal notes (kept locally, not published)
-docs/
+# Personal notes (kept locally, not published)
 note.txt
 
 # Misc
 *.log
+
+# Test caches
+.pytest_cache/
+
+# Red-team run outputs (contain answers; keep local)
+agent/redteam/results/
